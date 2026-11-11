@@ -31,11 +31,56 @@ type Stack struct {
 	endpoint *Endpoint
 	ipMu     sync.Mutex
 	ip       tcpip.Address
+
+	// shutdownHandler, when registered, receives fatal data-plane errors
+	// (server-initiated SHUTDOWN, unrecoverable L3 failures) instead of the
+	// default exit/panic. Embedders such as mobile libraries register it so
+	// the host process survives a dead session and can reconnect.
+	shutdownHandler func(error)
+
+	closeMu   sync.Mutex
+	closed    bool
+	closeOnce sync.Once
 }
 
 const NICID tcpip.NICID = 1
 const MTU uint32 = 1400
 const maxInboundPacketSize = 1500
+
+// SetShutdownHandler registers a callback that replaces the default exit on
+// fatal data-plane errors. It must be called before Run. Registering it also
+// stops the stack from panicking on L3 read/write failures: errors are
+// delivered to the handler asynchronously and Run returns, letting the
+// caller rebuild. Desktop callers keep the default behavior when unset.
+func (s *Stack) SetShutdownHandler(handler func(error)) {
+	s.shutdownHandler = handler
+}
+
+// Close stops the stack without exiting: the L3 connection is closed so Run's
+// read loop returns and in-flight writes fail fast. It is safe to call more
+// than once and is a no-op before Run created the connection.
+func (s *Stack) Close() {
+	s.closeOnce.Do(func() {
+		s.closeMu.Lock()
+		s.closed = true
+		s.closeMu.Unlock()
+		s.endpoint.closeL3Conn()
+	})
+}
+
+func (s *Stack) isClosed() bool {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closed
+}
+
+// reportShutdownHandler delivers a fatal error to the registered shutdown
+// handler without blocking the data-plane goroutine.
+func (s *Stack) reportShutdownHandler(err error) {
+	if handler := s.shutdownHandler; handler != nil {
+		go handler(err)
+	}
+}
 
 type Endpoint struct {
 	client clientpkg.Client
@@ -43,6 +88,9 @@ type Endpoint struct {
 	l3Conn io.ReadWriteCloser
 
 	dispatcher stack.NetworkDispatcher
+
+	// stack back-references the owning Stack for fatal-error policy.
+	stack *Stack
 }
 
 func (ep *Endpoint) ParseHeader(*stack.PacketBuffer) bool {
@@ -91,6 +139,12 @@ func (ep *Endpoint) Close() {}
 
 func (ep *Endpoint) SetOnCloseAction(func()) {}
 
+func (ep *Endpoint) closeL3Conn() {
+	if ep.l3Conn != nil {
+		_ = ep.l3Conn.Close()
+	}
+}
+
 // WritePackets is called when get packets from gVisor stack. Then it sends them to VPN server
 func (ep *Endpoint) WritePackets(list stack.PacketBufferList) (int, tcpip.Error) {
 	for _, packetBuffer := range list.AsSlice() {
@@ -111,6 +165,11 @@ func (ep *Endpoint) WritePackets(list stack.PacketBufferList) (int, tcpip.Error)
 				// is strictly better than panicking with a gvisor stack
 				// trace, which obscures the actual cause.
 				if errors.Is(err, easyconnect.ErrSangforShutdown) {
+					if ep.stack.shutdownHandler != nil {
+						log.Printf("WritePackets: server SHUTDOWN; reporting to shutdown handler")
+						ep.stack.reportShutdownHandler(err)
+						return list.Len(), nil
+					}
 					log.Printf("WritePackets: server SHUTDOWN; running cleanup hooks and exiting for clean restart")
 					if !hook_func.IsTerminal() {
 						hook_func.ExecTerminalFunc(context.Background())
@@ -118,11 +177,15 @@ func (ep *Endpoint) WritePackets(list stack.PacketBufferList) (int, tcpip.Error)
 					os.Exit(2)
 				}
 
-				if hook_func.IsTerminal() {
+				if ep.stack.isClosed() || hook_func.IsTerminal() {
 					return list.Len(), nil
-				} else {
-					panic(err)
 				}
+				if ep.stack.shutdownHandler != nil {
+					log.Printf("WritePackets: L3 write failed; reporting to shutdown handler: %v", err)
+					ep.stack.reportShutdownHandler(err)
+					return list.Len(), nil
+				}
+				panic(err)
 			}
 			log.DebugPrintf("Send: wrote %d bytes", n)
 			log.DebugDumpHex(buf[:n])
@@ -156,6 +219,7 @@ func NewStack(client clientpkg.Client) (*Stack, error) {
 
 	s.endpoint = &Endpoint{
 		client: client,
+		stack:  s,
 	}
 
 	tcpipErr := s.gvisorStack.CreateNIC(NICID, s.endpoint)
@@ -238,11 +302,15 @@ func (s *Stack) Run() {
 	for {
 		n, err := s.endpoint.l3Conn.Read(buf)
 		if err != nil {
-			if hook_func.IsTerminal() {
+			if s.isClosed() || hook_func.IsTerminal() {
 				return
-			} else {
-				panic(err)
 			}
+			if s.shutdownHandler != nil {
+				log.Printf("gVisor stack: L3 read failed; reporting to shutdown handler: %v", err)
+				s.reportShutdownHandler(err)
+				return
+			}
+			panic(err)
 		}
 		log.DebugPrintf("Recv: read %d bytes", n)
 		log.DebugDumpHex(buf[:n])

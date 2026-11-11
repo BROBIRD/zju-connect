@@ -245,3 +245,23 @@ func ServeHTTP(bindAddr string, dialer *dial.Dialer) {
 		}
 	}
 }
+
+// ServeHTTPOnListener serves the HTTP proxy over a caller-owned listener. The
+// caller controls the lifecycle: Serve returns once the listener is closed,
+// so embedders can stop the server without the process-wide terminal hooks.
+// In-flight CONNECT tunnels are closed when the server stops.
+func ServeHTTPOnListener(listener net.Listener, dialer *dial.Dialer) {
+	proxy := newHTTPProxy(dialer)
+
+	server := newHTTPServer("", proxy)
+
+	defer proxy.close()
+
+	if err := server.Serve(listener); err != nil {
+		if errors.Is(err, http.ErrServerClosed) {
+			log.Println("HTTP server closed")
+		} else {
+			log.Println("HTTP listen failed: " + err.Error())
+		}
+	}
+}

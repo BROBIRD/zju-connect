@@ -14,6 +14,28 @@ import (
 )
 
 func ServeSocks5(bindAddr string, dialer *dial.Dialer, resolver *resolve.Resolver, user string, password string) {
+	log.Printf("SOCKS5 server listening on %s", bindAddr)
+
+	listener, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		panic("SOCKS5 listen failed: " + err.Error())
+	}
+
+	hook_func.RegisterTerminalFunc("CloseSocks5Listener", func(ctx context.Context) error {
+		log.Println("Closing SOCKS5 listener...")
+		if err := listener.Close(); err != nil {
+			return fmt.Errorf("close SOCKS5 listener failed: %w", err)
+		}
+		return nil
+	})
+
+	ServeSocks5OnListener(listener, dialer, resolver, user, password)
+}
+
+// ServeSocks5OnListener serves SOCKS5 over a caller-owned listener. The
+// caller controls the lifecycle: Serve returns once the listener is closed,
+// so embedders can stop the server without the process-wide terminal hooks.
+func ServeSocks5OnListener(listener net.Listener, dialer *dial.Dialer, resolver *resolve.Resolver, user string, password string) {
 	var authMethods []socks5.Authenticator
 	if user != "" && password != "" {
 		authMethods = append(authMethods, socks5.UserPassAuthenticator{
@@ -33,22 +55,7 @@ func ServeSocks5(bindAddr string, dialer *dial.Dialer, resolver *resolve.Resolve
 		socks5.WithLogger(socks5.NewLogger(log.NewLogger("[SOCKS5] "))),
 	)
 
-	log.Printf("SOCKS5 server listening on %s", bindAddr)
-
-	listener, err := net.Listen("tcp", bindAddr)
-	if err != nil {
-		panic("SOCKS5 listen failed: " + err.Error())
-	}
-
-	hook_func.RegisterTerminalFunc("CloseSocks5Listener", func(ctx context.Context) error {
-		log.Println("Closing SOCKS5 listener...")
-		if err := listener.Close(); err != nil {
-			return fmt.Errorf("close SOCKS5 listener failed: %w", err)
-		}
-		return nil
-	})
-
-	if err = server.Serve(listener); err != nil {
+	if err := server.Serve(listener); err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			log.Println("SOCKS5 server closed")
 		} else {
